@@ -215,6 +215,8 @@ def main():
         st.session_state.detected_anomalies = {}
     if 'pending_removals' not in st.session_state:
         st.session_state.pending_removals = {}
+    if 'undo_stack' not in st.session_state:
+        st.session_state.undo_stack = []
 
     # File upload
     uploaded_file = st.file_uploader(
