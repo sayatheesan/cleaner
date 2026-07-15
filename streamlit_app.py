@@ -202,6 +202,27 @@ class AnomalyDetector:
 
         return outliers
 
+    @staticmethod
+    def detect_sudden_spikes(data, threshold=3.5):
+        """Detect sudden spikes from abrupt changes between adjacent values"""
+        outliers = pd.Series(False, index=data.index)
+
+        diff = data.diff().dropna()
+        if len(diff) < 3:
+            return outliers
+
+        median = diff.median()
+        mad = np.median(np.abs(diff - median))
+
+        if pd.isna(mad) or mad == 0:
+            return outliers
+
+        modified_z_scores = 0.6745 * (diff - median) / mad
+        spike_indices = diff.index[np.abs(modified_z_scores) > threshold]
+        outliers.loc[spike_indices] = True
+
+        return outliers
+
 def main():
     st.title("🧹 Automated Data Cleansing Tool")
     st.caption("Upload your data and let AI help you identify and remove anomalies")
@@ -299,6 +320,15 @@ def detect_anomalies(df, columns):
                     'indices': zscore_outliers[zscore_outliers].index.tolist(),
                     'confidence': 'High',
                     'description': f'Z-score > 3 standard deviations'
+                }
+
+            # Sudden spikes
+            spike_outliers = detector.detect_sudden_spikes(data)
+            if spike_outliers.sum() > 0:
+                column_anomalies['Sudden Spikes'] = {
+                    'indices': spike_outliers[spike_outliers].index.tolist(),
+                    'confidence': 'High',
+                    'description': 'Abrupt jump/change from the previous observation'
                 }
 
             # Isolation Forest
@@ -706,6 +736,7 @@ if __name__ == "__main__":
     if st.session_state.data is not None and st.session_state.original_data is not None:
         display_comparison_charts()
         create_summary_report()
+        display_download_section()
 
     # Footer
     st.markdown("---")
