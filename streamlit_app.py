@@ -335,7 +335,9 @@ def display_anomaly_results(df, selected_columns):
 
     st.subheader("🎯 Detected Anomalies")
 
-    for column, methods in st.session_state.detected_anomalies.items():
+    # Use a snapshot so actions that delete entries from session_state do not
+    # mutate the dictionary while it is being iterated.
+    for column, methods in list(st.session_state.detected_anomalies.items()):
         with st.expander(f"📈 {column} - {len(methods)} anomaly types detected", expanded=True):
 
             # Create visualization
