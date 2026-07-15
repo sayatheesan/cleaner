@@ -203,24 +203,26 @@ class AnomalyDetector:
         return outliers
 
     @staticmethod
-    def detect_sudden_spikes(data, threshold=3.5):
-        """Detect sudden spikes from abrupt changes between adjacent values"""
+    def detect_sudden_spikes(data, window=5, threshold=6.0):
+        """Detect major sudden spikes or drops based on local median deviation"""
         outliers = pd.Series(False, index=data.index)
 
-        diff = data.diff().dropna()
-        if len(diff) < 3:
+        if len(data) < window * 2:
             return outliers
 
-        median = diff.median()
-        mad = np.median(np.abs(diff - median))
+        min_periods = max(3, window // 2)
+        rolling_median = data.rolling(window=window, center=True, min_periods=min_periods).median()
+        rolling_mad = (data - rolling_median).abs().rolling(
+            window=window,
+            center=True,
+            min_periods=min_periods
+        ).median()
 
-        if pd.isna(mad) or mad == 0:
-            return outliers
+        rolling_mad = rolling_mad.replace(0, np.nan)
+        robust_z = 0.6745 * (data - rolling_median) / rolling_mad
+        mask = robust_z.abs() > threshold
 
-        modified_z_scores = 0.6745 * (diff - median) / mad
-        spike_indices = diff.index[np.abs(modified_z_scores) > threshold]
-        outliers.loc[spike_indices] = True
-
+        outliers.loc[mask.fillna(False).index] = mask.fillna(False)
         return outliers
 
 def main():
@@ -284,7 +286,7 @@ def main():
                 )
 
             if selected_columns and auto_detect:
-                detect_anomalies(df, selected_columns)
+                detect_anomalies(df, selected_columns, settings)
 
             # Display detected anomalies
             if st.session_state.detected_anomalies:
@@ -293,7 +295,7 @@ def main():
         except Exception as e:
             st.error(f"Error loading file: {str(e)}")
 
-def detect_anomalies(df, columns):
+def detect_anomalies(df, columns, settings):
     """Detect anomalies in selected columns"""
     detector = AnomalyDetector()
 
@@ -305,35 +307,50 @@ def detect_anomalies(df, columns):
             column_anomalies = {}
 
             # Statistical outliers (IQR method)
-            iqr_outliers = detector.detect_statistical_outliers(data, method='iqr')
+            iqr_outliers = detector.detect_statistical_outliers(
+                data,
+                method='iqr',
+                threshold=settings['iqr_threshold']
+            )
             if iqr_outliers.sum() > 0:
                 column_anomalies['IQR Outliers'] = {
                     'indices': iqr_outliers[iqr_outliers].index.tolist(),
                     'confidence': 'High',
-                    'description': f'Values outside 1.5×IQR range'
+                    'description': f'Values outside {settings["iqr_threshold"]}×IQR range'
                 }
 
             # Z-score outliers
-            zscore_outliers = detector.detect_statistical_outliers(data, method='zscore', threshold=3)
+            zscore_outliers = detector.detect_statistical_outliers(
+                data,
+                method='zscore',
+                threshold=settings['zscore_threshold']
+            )
             if zscore_outliers.sum() > 0:
                 column_anomalies['Z-Score Outliers'] = {
                     'indices': zscore_outliers[zscore_outliers].index.tolist(),
                     'confidence': 'High',
-                    'description': f'Z-score > 3 standard deviations'
+                    'description': f'Z-score > {settings["zscore_threshold"]} standard deviations'
                 }
 
             # Sudden spikes
-            spike_outliers = detector.detect_sudden_spikes(data)
+            spike_outliers = detector.detect_sudden_spikes(
+                data,
+                window=5,
+                threshold=settings['spike_threshold']
+            )
             if spike_outliers.sum() > 0:
                 column_anomalies['Sudden Spikes'] = {
                     'indices': spike_outliers[spike_outliers].index.tolist(),
                     'confidence': 'High',
-                    'description': 'Abrupt jump/change from the previous observation'
+                    'description': 'Major local spike or drop relative to the recent trend'
                 }
 
             # Isolation Forest
             if len(data.dropna()) >= 10:
-                iso_outliers = detector.detect_isolation_forest(data)
+                iso_outliers = detector.detect_isolation_forest(
+                    data,
+                    contamination=settings['isolation_contamination']
+                )
                 if iso_outliers.sum() > 0:
                     column_anomalies['Isolation Forest'] = {
                         'indices': iso_outliers[iso_outliers].index.tolist(),
@@ -342,12 +359,15 @@ def detect_anomalies(df, columns):
                     }
 
             # Consecutive duplicates
-            consecutive_dups = detector.detect_consecutive_duplicates(data)
+            consecutive_dups = detector.detect_consecutive_duplicates(
+                data,
+                min_consecutive=settings['consecutive_threshold']
+            )
             if consecutive_dups.sum() > 0:
                 column_anomalies['Consecutive Duplicates'] = {
                     'indices': consecutive_dups[consecutive_dups].index.tolist(),
                     'confidence': 'Medium',
-                    'description': '3+ consecutive identical values'
+                    'description': f'{settings["consecutive_threshold"]}+ consecutive identical values'
                 }
 
             if column_anomalies:
@@ -643,6 +663,15 @@ def display_advanced_settings():
             help="Higher values = less sensitive to outliers"
         )
 
+        spike_threshold = st.slider(
+            "Major Spike Threshold",
+            min_value=4.0,
+            max_value=8.0,
+            value=6.0,
+            step=0.5,
+            help="Only flag very large local spikes or drops"
+        )
+
         isolation_contamination = st.slider(
             "Isolation Forest Contamination",
             min_value=0.01,
@@ -672,6 +701,7 @@ def display_advanced_settings():
         return {
             'iqr_threshold': iqr_threshold,
             'zscore_threshold': zscore_threshold,
+            'spike_threshold': spike_threshold,
             'isolation_contamination': isolation_contamination,
             'consecutive_threshold': consecutive_threshold,
             'auto_remove_high_confidence': auto_remove_high_confidence
