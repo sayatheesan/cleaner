@@ -1,2 +1,5 @@
 streamlit
 plotly
+scipy
+scikit-learn
+openpyxl

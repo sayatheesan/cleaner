@@ -204,25 +204,90 @@ class AnomalyDetector:
 
     @staticmethod
     def detect_sudden_spikes(data, window=5, threshold=6.0):
-        """Detect major sudden spikes or drops based on local median deviation"""
+        """Detect major sudden spikes or drops by comparing each point to its immediate neighbouring x/y coordinates."""
         outliers = pd.Series(False, index=data.index)
 
-        if len(data) < window * 2:
+        numeric_data = pd.to_numeric(data, errors='coerce')
+        valid_data = numeric_data.dropna()
+
+        if len(valid_data) < 5:
+            return outliers
+
+        left_neighbor = valid_data.shift(1)
+        right_neighbor = valid_data.shift(-1)
+        neighbor_median = pd.concat([left_neighbor, right_neighbor], axis=1).median(axis=1)
+
+        point_to_neighbors = (valid_data - neighbor_median).abs()
+
+        left_diff = (valid_data - left_neighbor).abs()
+        right_diff = (right_neighbor - valid_data).abs()
+        neighbor_jump = pd.concat([left_diff, right_diff], axis=1).max(axis=1)
+
+        neighbor_jump_baseline = pd.concat(
+            [left_diff.shift(1), left_diff.shift(-1), right_diff.shift(1), right_diff.shift(-1)],
+            axis=1
+        ).median(axis=1).fillna(left_diff.median())
+
+        local_scale = valid_data.std(ddof=0)
+        if pd.isna(local_scale) or local_scale == 0:
+            local_scale = max(valid_data.abs().median(), 1.0)
+
+        spike_mask = (
+            (point_to_neighbors > local_scale * 2.5)
+            & (neighbor_jump > neighbor_jump_baseline * 1.5)
+        )
+
+        outliers.loc[spike_mask[spike_mask].index] = True
+        return outliers
+
+    @staticmethod
+    def detect_trend_spikes_ml(data, window=7, contamination=0.05):
+        """Use a learned trend model to detect abrupt electricity spikes or drops."""
+        outliers = pd.Series(False, index=data.index)
+
+        numeric_data = pd.to_numeric(data, errors='coerce')
+        valid_data = numeric_data.dropna()
+
+        if len(valid_data) < 20:
             return outliers
 
         min_periods = max(3, window // 2)
-        rolling_median = data.rolling(window=window, center=True, min_periods=min_periods).median()
-        rolling_mad = (data - rolling_median).abs().rolling(
+        rolling_mean = valid_data.rolling(window=window, center=True, min_periods=min_periods).mean()
+        rolling_std = valid_data.rolling(window=window, center=True, min_periods=min_periods).std(ddof=0).fillna(valid_data.std())
+        diff_abs = valid_data.diff().abs()
+        diff_std = diff_abs.rolling(window=window, center=True, min_periods=min_periods).std(ddof=0).fillna(diff_abs.std())
+
+        slope = valid_data.rolling(
             window=window,
             center=True,
             min_periods=min_periods
-        ).median()
+        ).apply(lambda x: np.polyfit(np.arange(len(x)), x, 1)[0], raw=True)
 
-        rolling_mad = rolling_mad.replace(0, np.nan)
-        robust_z = 0.6745 * (data - rolling_median) / rolling_mad
-        mask = robust_z.abs() > threshold
+        feature_frame = pd.DataFrame({
+            'value': valid_data,
+            'rolling_mean': rolling_mean,
+            'rolling_std': rolling_std,
+            'diff_abs': diff_abs,
+            'diff_z': diff_abs / diff_std.replace(0, np.nan),
+            'trend_slope': slope
+        }).replace([np.inf, -np.inf], np.nan).dropna()
 
-        outliers.loc[mask.fillna(False).index] = mask.fillna(False)
+        if len(feature_frame) < 10:
+            return outliers
+
+        scaler = StandardScaler()
+        scaled_features = scaler.fit_transform(feature_frame)
+
+        iso_forest = IsolationForest(contamination=contamination, random_state=42)
+        anomaly_scores = iso_forest.fit_predict(scaled_features)
+
+        ml_mask = pd.Series(False, index=feature_frame.index)
+        ml_mask.loc[feature_frame.index] = anomaly_scores == -1
+
+        # Only keep strong spikes/drops that also look like a sudden change
+        strong_jump_mask = ml_mask & (feature_frame['diff_z'].abs() > 2.5)
+        outliers.loc[strong_jump_mask[strong_jump_mask].index] = True
+
         return outliers
 
 def main():
@@ -240,6 +305,8 @@ def main():
         st.session_state.pending_removals = {}
     if 'undo_stack' not in st.session_state:
         st.session_state.undo_stack = []
+    if 'manual_selections' not in st.session_state:
+        st.session_state.manual_selections = {}
 
     # File upload
     uploaded_file = st.file_uploader(
@@ -269,23 +336,13 @@ def main():
                 st.error("No numeric columns found for anomaly detection")
                 return
 
-            col1, col2 = st.columns([2, 1])
+            selected_columns = st.multiselect(
+                "Select columns for anomaly detection",
+                numeric_columns,
+                default=numeric_columns[:3] if len(numeric_columns) >= 3 else numeric_columns
+            )
 
-            with col1:
-                selected_columns = st.multiselect(
-                    "Select columns for anomaly detection",
-                    numeric_columns,
-                    default=numeric_columns[:3] if len(numeric_columns) >= 3 else numeric_columns
-                )
-
-            with col2:
-                auto_detect = st.button(
-                    "🔍 Auto-Detect Anomalies",
-                    type="primary",
-                    use_container_width=True
-                )
-
-            if selected_columns and auto_detect:
+            if selected_columns:
                 detect_anomalies(df, selected_columns, settings)
 
             # Display detected anomalies
@@ -345,6 +402,19 @@ def detect_anomalies(df, columns, settings):
                     'description': 'Major local spike or drop relative to the recent trend'
                 }
 
+            # Trend-based machine learning spike detection
+            trend_ml_outliers = detector.detect_trend_spikes_ml(
+                data,
+                window=7,
+                contamination=settings['isolation_contamination']
+            )
+            if trend_ml_outliers.sum() > 0:
+                column_anomalies['Trend ML Spikes'] = {
+                    'indices': trend_ml_outliers[trend_ml_outliers].index.tolist(),
+                    'confidence': 'High',
+                    'description': 'Machine learning detected a sudden change in the trend'
+                }
+
             # Isolation Forest
             if len(data.dropna()) >= 10:
                 iso_outliers = detector.detect_isolation_forest(
@@ -392,7 +462,23 @@ def display_anomaly_results(df, selected_columns):
 
             # Create visualization
             fig = create_anomaly_chart(df, column, methods)
-            st.plotly_chart(fig, use_container_width=True)
+            chart_event = st.plotly_chart(
+                fig,
+                use_container_width=True,
+                key=f"chart_{column}",
+                on_select="rerun",
+                selection_mode=['points', 'box']
+            )
+
+            selected_indices = []
+            if chart_event:
+                selection_state = chart_event.get('selection', {}) if isinstance(chart_event, dict) else getattr(chart_event, 'selection', {})
+                if selection_state:
+                    selected_indices = [int(i) for i in selection_state.get('point_indices', [])]
+
+            if selected_indices:
+                st.session_state.manual_selections[column] = sorted(set(selected_indices))
+                st.caption("🖱️ Drag a box on the chart or select points, then remove the highlighted region.")
 
             # Anomaly details and actions
             col1, col2 = st.columns([2, 1])
@@ -429,6 +515,13 @@ def display_anomaly_results(df, selected_columns):
                     all_indices.update(details['indices'])
 
                 st.write(f"Total anomalies: {len(all_indices)}")
+
+                manual_selected = st.session_state.manual_selections.get(column, [])
+                if manual_selected:
+                    st.info(f"Selected {len(manual_selected)} chart points for manual removal.")
+                    if st.button(f"🗑️ Remove Selected Region", key=f"manual_remove_{column}"):
+                        remove_selected_region(column, manual_selected)
+                        st.rerun()
 
                 # Confirmation button
                 result = confirmation_button(
@@ -499,6 +592,25 @@ def auto_remove_anomalies(column, methods):
         del st.session_state.detected_anomalies[column]
 
     st.success(f"✅ Automatically removed {len(indices_to_remove)} high-confidence anomalies from {column}")
+
+def remove_selected_region(column, selected_indices):
+    """Remove a manually selected region from a chart for a specific column."""
+    if not selected_indices:
+        return
+
+    st.session_state.undo_stack.append(st.session_state.data.copy())
+
+    # Convert selection indices to the current dataframe's row labels
+    selected_rows = st.session_state.data.iloc[selected_indices].index.tolist()
+    st.session_state.data.loc[selected_rows, column] = np.nan
+
+    if column in st.session_state.detected_anomalies:
+        del st.session_state.detected_anomalies[column]
+
+    if column in st.session_state.manual_selections:
+        del st.session_state.manual_selections[column]
+
+    st.success(f"✅ Removed {len(selected_rows)} manually selected points from {column}")
 
 def remove_all_anomalies(column):
     """Remove all detected anomalies for a column"""
@@ -638,74 +750,16 @@ def display_comparison_charts():
             st.write(f"Min: {cleaned_stats['min']:.2f}")
             st.write(f"Max: {cleaned_stats['max']:.2f}")
 
-def display_advanced_settings():
-    """Display advanced anomaly detection settings"""
-    with st.sidebar:
-        st.header("⚙️ Advanced Settings")
-
-        st.subheader("Detection Thresholds")
-
-        iqr_threshold = st.slider(
-            "IQR Multiplier",
-            min_value=1.0,
-            max_value=3.0,
-            value=1.5,
-            step=0.1,
-            help="Higher values = less sensitive to outliers"
-        )
-
-        zscore_threshold = st.slider(
-            "Z-Score Threshold",
-            min_value=2.0,
-            max_value=4.0,
-            value=3.0,
-            step=0.1,
-            help="Higher values = less sensitive to outliers"
-        )
-
-        spike_threshold = st.slider(
-            "Major Spike Threshold",
-            min_value=4.0,
-            max_value=8.0,
-            value=6.0,
-            step=0.5,
-            help="Only flag very large local spikes or drops"
-        )
-
-        isolation_contamination = st.slider(
-            "Isolation Forest Contamination",
-            min_value=0.01,
-            max_value=0.3,
-            value=0.1,
-            step=0.01,
-            help="Expected proportion of outliers"
-        )
-
-        consecutive_threshold = st.slider(
-            "Consecutive Duplicates Threshold",
-            min_value=2,
-            max_value=10,
-            value=3,
-            step=1,
-            help="Minimum consecutive identical values to flag"
-        )
-
-        st.subheader("Auto-removal Settings")
-
-        auto_remove_high_confidence = st.checkbox(
-            "Auto-remove high confidence anomalies",
-            value=False,
-            help="Automatically remove anomalies with high confidence without confirmation"
-        )
-
-        return {
-            'iqr_threshold': iqr_threshold,
-            'zscore_threshold': zscore_threshold,
-            'spike_threshold': spike_threshold,
-            'isolation_contamination': isolation_contamination,
-            'consecutive_threshold': consecutive_threshold,
-            'auto_remove_high_confidence': auto_remove_high_confidence
-        }
+def get_default_detection_settings():
+    """Return built-in automatic anomaly-detection settings."""
+    return {
+        'iqr_threshold': 1.5,
+        'zscore_threshold': 3.0,
+        'spike_threshold': 6.0,
+        'isolation_contamination': 0.1,
+        'consecutive_threshold': 3,
+        'auto_remove_high_confidence': False
+    }
 
 def create_summary_report():
     """Create a summary report of the cleaning process"""
@@ -756,8 +810,8 @@ def create_summary_report():
 
 # Main execution
 if __name__ == "__main__":
-    # Display advanced settings in sidebar
-    settings = display_advanced_settings()
+    # Use automatic built-in detection thresholds
+    settings = get_default_detection_settings()
 
     # Run main application
     main()
