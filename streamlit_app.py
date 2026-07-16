@@ -182,113 +182,159 @@ class AnomalyDetector:
         scaler = StandardScaler()
         data_scaled = scaler.fit_transform(data.dropna().values.reshape(-1, 1))
 
-        iso_forest = IsolationForest(contamination=contamination, random_state=42)
+        iso_forest = IsolationForest(contamination=contamination, n_estimators=100, random_state=42, n_jobs=-1)
+
         outliers_mask = iso_forest.fit_predict(data_scaled) == -1
 
         outliers = pd.Series(False, index=data.index)
         outliers.loc[data.dropna().index] = outliers_mask
 
         return outliers
-
+    
     @staticmethod
-    def detect_consecutive_duplicates(data, min_consecutive=3):
-        """Detect consecutive duplicate values"""
+    def detect_voltage_anomalies(
+        data,
+        window=15,
+        residual_z_threshold=4,
+        gradient_z_threshold=4
+    ):
+
         outliers = pd.Series(False, index=data.index)
 
-        for i in range(len(data) - min_consecutive + 1):
-            window = data.iloc[i:i + min_consecutive]
-            if len(window.unique()) == 1 and not pd.isna(window.iloc[0]):
-                outliers.iloc[i:i + min_consecutive] = True
+        s = pd.to_numeric(data, errors="coerce")
+        valid = s.dropna()
 
-        return outliers
-
-    @staticmethod
-    def detect_sudden_spikes(data, window=5, threshold=6.0):
-        """Detect major sudden spikes or drops by comparing each point to its immediate neighbouring x/y coordinates."""
-        outliers = pd.Series(False, index=data.index)
-
-        numeric_data = pd.to_numeric(data, errors='coerce')
-        valid_data = numeric_data.dropna()
-
-        if len(valid_data) < 5:
+        if len(valid) < window:
             return outliers
 
-        left_neighbor = valid_data.shift(1)
-        right_neighbor = valid_data.shift(-1)
-        neighbor_median = pd.concat([left_neighbor, right_neighbor], axis=1).median(axis=1)
-
-        point_to_neighbors = (valid_data - neighbor_median).abs()
-
-        left_diff = (valid_data - left_neighbor).abs()
-        right_diff = (right_neighbor - valid_data).abs()
-        neighbor_jump = pd.concat([left_diff, right_diff], axis=1).max(axis=1)
-
-        neighbor_jump_baseline = pd.concat(
-            [left_diff.shift(1), left_diff.shift(-1), right_diff.shift(1), right_diff.shift(-1)],
-            axis=1
-        ).median(axis=1).fillna(left_diff.median())
-
-        local_scale = valid_data.std(ddof=0)
-        if pd.isna(local_scale) or local_scale == 0:
-            local_scale = max(valid_data.abs().median(), 1.0)
-
-        spike_mask = (
-            (point_to_neighbors > local_scale * 2.5)
-            & (neighbor_jump > neighbor_jump_baseline * 1.5)
-        )
-
-        outliers.loc[spike_mask[spike_mask].index] = True
-        return outliers
-
-    @staticmethod
-    def detect_trend_spikes_ml(data, window=7, contamination=0.05):
-        """Use a learned trend model to detect abrupt electricity spikes or drops."""
-        outliers = pd.Series(False, index=data.index)
-
-        numeric_data = pd.to_numeric(data, errors='coerce')
-        valid_data = numeric_data.dropna()
-
-        if len(valid_data) < 20:
-            return outliers
-
-        min_periods = max(3, window // 2)
-        rolling_mean = valid_data.rolling(window=window, center=True, min_periods=min_periods).mean()
-        rolling_std = valid_data.rolling(window=window, center=True, min_periods=min_periods).std(ddof=0).fillna(valid_data.std())
-        diff_abs = valid_data.diff().abs()
-        diff_std = diff_abs.rolling(window=window, center=True, min_periods=min_periods).std(ddof=0).fillna(diff_abs.std())
-
-        slope = valid_data.rolling(
+        trend = valid.rolling(
             window=window,
             center=True,
-            min_periods=min_periods
-        ).apply(lambda x: np.polyfit(np.arange(len(x)), x, 1)[0], raw=True)
+            min_periods=5
+        ).median()
 
-        feature_frame = pd.DataFrame({
-            'value': valid_data,
-            'rolling_mean': rolling_mean,
-            'rolling_std': rolling_std,
-            'diff_abs': diff_abs,
-            'diff_z': diff_abs / diff_std.replace(0, np.nan),
-            'trend_slope': slope
-        }).replace([np.inf, -np.inf], np.nan).dropna()
+        residual = valid - trend
 
-        if len(feature_frame) < 10:
-            return outliers
+        residual_median = np.median(residual)
+        residual_mad = np.median(
+            np.abs(residual - residual_median)
+        )
 
-        scaler = StandardScaler()
-        scaled_features = scaler.fit_transform(feature_frame)
+        residual_mad = max(residual_mad, 1e-9)
 
-        iso_forest = IsolationForest(contamination=contamination, random_state=42)
-        anomaly_scores = iso_forest.fit_predict(scaled_features)
+        residual_z = (
+            0.6745 *
+            (residual - residual_median)
+            / residual_mad
+        )
 
-        ml_mask = pd.Series(False, index=feature_frame.index)
-        ml_mask.loc[feature_frame.index] = anomaly_scores == -1
+        gradient = valid.diff()
 
-        # Only keep strong spikes/drops that also look like a sudden change
-        strong_jump_mask = ml_mask & (feature_frame['diff_z'].abs() > 2.5)
-        outliers.loc[strong_jump_mask[strong_jump_mask].index] = True
+        gradient_median = np.median(
+            gradient.dropna()
+        )
+
+        gradient_mad = np.median(
+            np.abs(
+                gradient.dropna()
+                - gradient_median
+            )
+        )
+
+        gradient_mad = max(
+            gradient_mad,
+            1e-9
+        )
+
+        gradient_z = (
+            0.6745 *
+            (gradient - gradient_median)
+            / gradient_mad
+        )
+
+        spike_mask = (
+            np.abs(residual_z)
+            > residual_z_threshold
+        ) & (
+            np.abs(gradient_z)
+            > gradient_z_threshold
+        )
+
+        prev_val = valid.shift(1)
+        next_val = valid.shift(-1)
+
+        local_mid = (
+            prev_val + next_val
+        ) / 2
+
+        deviation = np.abs(
+            valid - local_mid
+        )
+
+        baseline_jump = np.median(
+            np.abs(valid.diff())
+        )
+
+        reversal_spikes = (
+            deviation >
+            baseline_jump * 6
+        )
+
+        before = (
+            valid
+            .rolling(10, min_periods=3)
+            .mean()
+            .shift(1)
+        )
+
+        after = (
+            valid[::-1]
+            .rolling(10, min_periods=3)
+            .mean()[::-1]
+        )
+
+        step_shift = np.abs(
+            after - before
+        )
+
+        step_mask = (
+            step_shift >
+            baseline_jump * 8
+        )
+
+        score = (
+            spike_mask.astype(int) * 3 +
+            reversal_spikes.astype(int) * 4 +
+            step_mask.astype(int) * 3
+        )
+
+        final_mask = score >= 4
+
+        outliers.loc[
+            final_mask[final_mask].index
+        ] = True
 
         return outliers
+
+    
+    @staticmethod
+    def detect_consecutive_duplicates(
+        data,
+        min_consecutive=3
+    ):
+
+        groups = (
+            data != data.shift()
+        ).cumsum()
+
+        counts = (
+            data.groupby(groups)
+            .transform("size")
+        )
+
+        return (
+            counts >= min_consecutive
+        ) & data.notna()
 
 def main():
     st.title("🧹 Automated Data Cleansing Tool")
@@ -307,6 +353,10 @@ def main():
         st.session_state.undo_stack = []
     if 'manual_selections' not in st.session_state:
         st.session_state.manual_selections = {}
+    if 'auto_detect_done' not in st.session_state:
+        st.session_state.auto_detect_done = False
+    if 'last_selection' not in st.session_state:
+        st.session_state.last_selection = ()
 
     # File upload
     uploaded_file = st.file_uploader(
@@ -319,12 +369,19 @@ def main():
         # Load data
         try:
             df = pd.read_csv(uploaded_file)
-            if st.session_state.original_data is None:
+
+            if st.session_state.original_data is None or uploaded_file.name != st.session_state.get("last_file"):
+                st.session_state.detected_anomalies = {}
+                st.session_state.manual_selections = {}
+                st.session_state.last_selection = ()
+                st.session_state.auto_detect_done = False
                 st.session_state.original_data = df.copy()
-            st.session_state.data = df
+                st.session_state.data = df.copy()
+                st.session_state.last_file = uploaded_file.name
 
             st.success(f"✅ Loaded {len(df)} rows and {len(df.columns)} columns")
 
+            st.info(f"Dataset contains {len(df):,} rows")
             # Data preview
             with st.expander("📊 Data Preview", expanded=True):
                 st.dataframe(df.head(), use_container_width=True)
@@ -342,12 +399,38 @@ def main():
                 default=numeric_columns[:3] if len(numeric_columns) >= 3 else numeric_columns
             )
 
+            current_selection = tuple(sorted(selected_columns))
+
+            if (
+                st.session_state.get("last_selection")
+                != current_selection
+            ):
+
+                detect_anomalies(
+                    st.session_state.data,
+                    selected_columns,
+                    settings
+                )
+
+                st.session_state.last_selection = (
+                    current_selection
+                )
+
             if selected_columns:
-                detect_anomalies(df, selected_columns, settings)
+
+                if st.button(
+                    "🔍 Detect Anomalies",
+                    key="run_detection"
+                ):
+                    detect_anomalies(
+                        st.session_state.data,
+                        selected_columns,
+                        settings
+                    )
 
             # Display detected anomalies
             if st.session_state.detected_anomalies:
-                display_anomaly_results(df, selected_columns)
+                display_anomaly_results(st.session_state.data, selected_columns)
 
         except Exception as e:
             st.error(f"Error loading file: {str(e)}")
@@ -390,29 +473,21 @@ def detect_anomalies(df, columns, settings):
                 }
 
             # Sudden spikes
-            spike_outliers = detector.detect_sudden_spikes(
-                data,
-                window=5,
-                threshold=settings['spike_threshold']
+            voltage_outliers = ( 
+                detector.detect_voltage_anomalies(
+                    data,
+                    window=5,
+                )
             )
-            if spike_outliers.sum() > 0:
-                column_anomalies['Sudden Spikes'] = {
-                    'indices': spike_outliers[spike_outliers].index.tolist(),
+            
+            if voltage_outliers.sum() > 0:
+                column_anomalies['Voltage Anomalies'] = {
+                    'indices': voltage_outliers[
+                        voltage_outliers
+                    ].index.tolist(),
                     'confidence': 'High',
-                    'description': 'Major local spike or drop relative to the recent trend'
-                }
-
-            # Trend-based machine learning spike detection
-            trend_ml_outliers = detector.detect_trend_spikes_ml(
-                data,
-                window=7,
-                contamination=settings['isolation_contamination']
-            )
-            if trend_ml_outliers.sum() > 0:
-                column_anomalies['Trend ML Spikes'] = {
-                    'indices': trend_ml_outliers[trend_ml_outliers].index.tolist(),
-                    'confidence': 'High',
-                    'description': 'Machine learning detected a sudden change in the trend'
+                    'description':
+                        'Detected spikes, drops, trend breaks and step changes'
                 }
 
             # Isolation Forest
@@ -470,11 +545,37 @@ def display_anomaly_results(df, selected_columns):
                 selection_mode=['points', 'box']
             )
 
-            selected_indices = []
+            selected_indices = st.session_state.manual_selections.get(column,[])
+
             if chart_event:
-                selection_state = chart_event.get('selection', {}) if isinstance(chart_event, dict) else getattr(chart_event, 'selection', {})
+
+                selection_state = (
+                    chart_event.get("selection", {})
+                    if isinstance(chart_event, dict)
+                    else getattr(chart_event, "selection", {})
+                )
+
                 if selection_state:
-                    selected_indices = [int(i) for i in selection_state.get('point_indices', [])]
+
+                    selected_indices = [
+                        int(i)
+                        for i in selection_state.get(
+                            "point_indices",
+                            []
+                        )
+                    ]
+
+                    if selected_indices:
+                        st.session_state.manual_selections[column] = (
+                            sorted(set(selected_indices))
+                        )
+                    else:
+                        selected_indices = (
+                            st.session_state.manual_selections.get(
+                                column,
+                                []
+                            )
+                        )
 
             if selected_indices:
                 st.session_state.manual_selections[column] = sorted(set(selected_indices))
@@ -521,7 +622,6 @@ def display_anomaly_results(df, selected_columns):
                     st.info(f"Selected {len(manual_selected)} chart points for manual removal.")
                     if st.button(f"🗑️ Remove Selected Region", key=f"manual_remove_{column}"):
                         remove_selected_region(column, manual_selected)
-                        st.rerun()
 
                 # Confirmation button
                 result = confirmation_button(
@@ -531,35 +631,61 @@ def display_anomaly_results(df, selected_columns):
 
                 if result and result.get("confirmed"):
                     remove_all_anomalies(column)
-                    st.rerun()
 
 def create_anomaly_chart(df, column, methods):
     """Create interactive chart showing anomalies"""
+
+    plot_df = df
+
     fig = go.Figure()
 
     # Plot original data
-    fig.add_trace(go.Scatter(
-        x=df.index,
-        y=df[column],
+    fig.add_trace(go.Scattergl(
+        x=plot_df.index,
+        y=plot_df[column],
         mode='lines+markers',
-        name='Original Data',
+        name='Current Data',
+        connectgaps=False,
         line=dict(color='blue', width=1),
-        marker=dict(size=4)
+        marker=dict(size=2)
     ))
+
+    removed_mask = df[column].isna()
+
+    if removed_mask.any():
+
+        fig.add_trace(
+            go.Scattergl(
+                x=df.index[removed_mask],
+                y=st.session_state.original_data.loc[
+                    removed_mask,
+                    column
+                ],
+                mode="markers",
+                marker=dict(
+                    color="black",
+                    size=10,
+                    symbol="x"
+                ),
+                name="Removed Values"
+            )
+        )
+
 
     # Highlight anomalies by method
     colors = ['red', 'orange', 'purple', 'brown']
 
     for i, (method, details) in enumerate(methods.items()):
         indices = details['indices']
-        fig.add_trace(go.Scatter(
+
+        fig.add_trace(go.Scattergl(
             x=indices,
             y=df.loc[indices, column],
             mode='markers',
             name=f'{method} ({len(indices)} points)',
             marker=dict(
                 color=colors[i % len(colors)],
-                 size=8,
+                size=8,
                 symbol='x'
             )
         ))
@@ -575,60 +701,68 @@ def create_anomaly_chart(df, column, methods):
     return fig
 
 def auto_remove_anomalies(column, methods):
-    """Automatically remove high confidence anomalies"""
-    # Save current state for undo
-    st.session_state.undo_stack.append(st.session_state.data.copy())
+
+    st.session_state.undo_stack.append(
+        st.session_state.data.copy()
+    )
 
     indices_to_remove = set()
+
     for method in methods:
-        if method in st.session_state.detected_anomalies[column]:
-            indices_to_remove.update(st.session_state.detected_anomalies[column][method]['indices'])
+        if (
+            column in st.session_state.detected_anomalies
+            and method in st.session_state.detected_anomalies[column]
+        ):
+            indices_to_remove.update(
+                st.session_state.detected_anomalies[column][method]["indices"]
+            )
 
-    # Remove anomalies by setting to NaN
-    st.session_state.data.loc[list(indices_to_remove), column] = np.nan
+    st.session_state.data.loc[
+        list(indices_to_remove),
+        column
+    ] = np.nan
 
-    # Update detected anomalies
-    if column in st.session_state.detected_anomalies:
-        del st.session_state.detected_anomalies[column]
-
-    st.success(f"✅ Automatically removed {len(indices_to_remove)} high-confidence anomalies from {column}")
-
+    st.rerun()
 def remove_selected_region(column, selected_indices):
-    """Remove a manually selected region from a chart for a specific column."""
+
     if not selected_indices:
         return
 
-    st.session_state.undo_stack.append(st.session_state.data.copy())
+    st.session_state.undo_stack.append(
+        st.session_state.data.copy()
+    )
 
-    # Convert selection indices to the current dataframe's row labels
-    selected_rows = st.session_state.data.iloc[selected_indices].index.tolist()
-    st.session_state.data.loc[selected_rows, column] = np.nan
+    selected_rows = (
+        st.session_state.data
+        .index[selected_indices]
+        .tolist()
+    )
 
-    if column in st.session_state.detected_anomalies:
-        del st.session_state.detected_anomalies[column]
+    st.session_state.data.loc[
+        selected_rows,
+        column
+    ] = np.nan
 
-    if column in st.session_state.manual_selections:
-        del st.session_state.manual_selections[column]
-
-    st.success(f"✅ Removed {len(selected_rows)} manually selected points from {column}")
+    st.rerun()
 
 def remove_all_anomalies(column):
-    """Remove all detected anomalies for a column"""
-    # Save current state for undo
-    st.session_state.undo_stack.append(st.session_state.data.copy())
+
+    st.session_state.undo_stack.append(
+        st.session_state.data.copy()
+    )
 
     all_indices = set()
+
     for details in st.session_state.detected_anomalies[column].values():
-        all_indices.update(details['indices'])
+        all_indices.update(details["indices"])
 
-    # Remove anomalies by setting to NaN
-    st.session_state.data.loc[list(all_indices), column] = np.nan
+    st.session_state.data.loc[
+        list(all_indices),
+        column
+    ] = np.nan
 
-    # Update detected anomalies
-    if column in st.session_state.detected_anomalies:
-        del st.session_state.detected_anomalies[column]
+    st.rerun()
 
-    st.success(f"✅ Removed {len(all_indices)} anomalies from {column}")
 
 def undo_last_action():
     """Undo the last data modification"""
@@ -645,9 +779,15 @@ def display_download_section():
     with col1:
         # Statistics
         original_rows = len(st.session_state.original_data) if st.session_state.original_data is not None else 0
-        current_rows = len(st.session_state.data.dropna())
-        removed_rows = original_rows - current_rows
+        
+        removed_rows = (
+            st.session_state.data
+            .isna()
+            .sum()
+            .sum()
+        )
 
+        current_rows = len(st.session_state.data)
         st.metric("Original Rows", original_rows)
         st.metric("Cleaned Rows", current_rows)
         st.metric("Removed Anomalies", removed_rows)
@@ -721,6 +861,11 @@ def display_comparison_charts():
                 y=st.session_state.original_data[selected_column],
                 title=f"Original {selected_column}"
             )
+
+            fig_original.update_traces(
+                connectgaps=False
+            )
+
             fig_original.update_layout(height=300)
             st.plotly_chart(fig_original, use_container_width=True)
 
@@ -737,9 +882,18 @@ def display_comparison_charts():
             fig_cleaned = px.line(
                 x=st.session_state.data.index,
                 y=st.session_state.data[selected_column],
+                markers=True,
                 title=f"Cleaned {selected_column}"
             )
-            fig_cleaned.update_layout(height=300)
+
+            fig_cleaned.update_traces(
+                connectgaps=False
+            )
+
+            fig_cleaned.update_layout(
+                height=300
+            )
+
             st.plotly_chart(fig_cleaned, use_container_width=True)
 
             # Cleaned statistics
@@ -779,8 +933,15 @@ def create_summary_report():
     with col2:
         st.metric("Current Rows", current_shape[0])
     with col3:
-        removed_rows = original_shape[0] - current_shape[0]
-        st.metric("Rows Removed", removed_rows)
+
+        removed_rows = (
+            st.session_state.data
+            .isna()
+            .sum()
+            .sum()
+        )
+        
+        st.metric("Values Removed", removed_rows)
     with col4:
         removal_percentage = (removed_rows / original_shape[0]) * 100 if original_shape[0] > 0 else 0
         st.metric("Removal %", f"{removal_percentage:.1f}%")
@@ -816,8 +977,8 @@ if __name__ == "__main__":
     # Run main application
     main()
 
-    # Display comparison charts if data is available
     if st.session_state.data is not None and st.session_state.original_data is not None:
+
         display_comparison_charts()
         create_summary_report()
         display_download_section()
