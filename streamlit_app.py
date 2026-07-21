@@ -336,6 +336,11 @@ class AnomalyDetector:
             counts >= min_consecutive
         ) & data.notna()
 
+    @staticmethod
+    def detect_zero_values(data):
+        """Detect zero values"""
+        return (pd.to_numeric(data, errors="coerce") == 0)  
+
 def main():
     st.title("🧹 Automated Data Cleansing Tool")
     st.caption("Upload your data and let AI help you identify and remove anomalies")
@@ -369,6 +374,7 @@ def main():
         # Load data
         try:
             df = pd.read_csv(uploaded_file)
+            df = df.replace(0, np.nan)
 
             if st.session_state.original_data is None or uploaded_file.name != st.session_state.get("last_file"):
                 st.session_state.detected_anomalies = {}
@@ -524,6 +530,16 @@ def detect_anomalies(df, columns, settings):
             st.success(f"🎯 Found anomalies in {len(anomalies)} columns")
         else:
             st.info("✨ No significant anomalies detected")
+
+    # Zero values
+    zero_outliers = detector.detect_zero_values(data)
+
+    if zero_outliers.sum() > 0:
+        column_anomalies['Zero Values'] = {
+            'indices': zero_outliers[zero_outliers].index.tolist(),
+            'confidence': 'High',
+            'description': 'Zero values detected'
+        }
 
 def display_anomaly_results(df, selected_columns):
     """Display anomaly detection results with interactive charts"""
@@ -751,7 +767,7 @@ def remove_all_anomalies(column):
         st.session_state.data.copy()
     )
 
-    all_indices = set()
+    all_indices = set() 
 
     for details in st.session_state.detected_anomalies[column].values():
         all_indices.update(details["indices"])
@@ -762,7 +778,6 @@ def remove_all_anomalies(column):
     ] = np.nan
 
     st.rerun()
-
 
 def undo_last_action():
     """Undo the last data modification"""
