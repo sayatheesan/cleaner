@@ -676,13 +676,13 @@ def create_anomaly_chart(df, column, methods):
         marker=dict(size=2)
     ))
 
-    removed_mask = df[column].isna()
+    removed_mask = st.session_state.data[column].isna()
 
     if removed_mask.any():
 
         fig.add_trace(
             go.Scattergl(
-                x=df.index[removed_mask],
+                x=st.session_state.data.index[removed_mask],
                 y=st.session_state.original_data.loc[
                     removed_mask,
                     column
@@ -710,7 +710,7 @@ def create_anomaly_chart(df, column, methods):
         # Make zero values stand out
         if method == "Zero Values":
             marker_size = 14
-            marker_color = "black"
+            marker_color = "orange"
             marker_symbol = "diamond"
 
         fig.add_trace(go.Scattergl(
