@@ -339,7 +339,7 @@ class AnomalyDetector:
     @staticmethod
     def detect_zero_values(data):
         """Detect zero values"""
-        return (pd.to_numeric(data, errors="coerce") == 0)  
+        return (pd.to_numeric(data, errors="coerce") == 0)
 
 def main():
     st.title("🧹 Automated Data Cleansing Tool")
@@ -521,6 +521,16 @@ def detect_anomalies(df, columns, settings):
                     'description': f'{settings["consecutive_threshold"]}+ consecutive identical values'
                 }
 
+            # Zero values
+            zero_outliers = detector.detect_zero_values(data)
+
+            if zero_outliers.sum() > 0:
+                column_anomalies['Zero Values'] = {
+                    'indices': zero_outliers[zero_outliers].index.tolist(),
+                    'confidence': 'High',
+                    'description': 'Zero values detected'
+                }
+
             if column_anomalies:
                 anomalies[column] = column_anomalies
 
@@ -687,12 +697,21 @@ def create_anomaly_chart(df, column, methods):
             )
         )
 
-
     # Highlight anomalies by method
     colors = ['red', 'orange', 'purple', 'brown']
 
     for i, (method, details) in enumerate(methods.items()):
         indices = details['indices']
+
+        marker_size = 8
+        marker_color = colors[i % len(colors)]
+        marker_symbol = 'x'
+
+        # Make zero values stand out
+        if method == "Zero Values":
+            marker_size = 14
+            marker_color = "black"
+            marker_symbol = "diamond"
 
         fig.add_trace(go.Scattergl(
             x=indices,
@@ -700,9 +719,9 @@ def create_anomaly_chart(df, column, methods):
             mode='markers',
             name=f'{method} ({len(indices)} points)',
             marker=dict(
-                color=colors[i % len(colors)],
-                size=8,
-                symbol='x'
+                color=marker_color,
+                size=marker_size,
+                symbol=marker_symbol
             )
         ))
 
